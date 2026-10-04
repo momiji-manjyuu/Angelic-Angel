@@ -2,6 +2,14 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AngelicAngelError {
+    #[error("{0}")]
+    Outbox(#[from] crate::outbox::OutboxError),
+
+    #[error("{0}")]
+    Delivery(#[from] crate::delivery::DeliveryError),
+
+    #[error("background task did not complete")]
+    BackgroundTask,
     #[error("config error: {0}")]
     Config(String),
 
@@ -11,7 +19,7 @@ pub enum AngelicAngelError {
     #[error("Twitter API error: {0}")]
     TwitterApi(String),
 
-    #[error("WebSocket error: {0}")]
+    #[error("WebSocket transport failed")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
 
     #[error("decryption error: {0}")]
@@ -24,13 +32,13 @@ pub enum AngelicAngelError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("HTTP error: {0}")]
+    #[error("HTTP request failed")]
     Http(#[from] reqwest::Error),
 
-    #[error("JSON error: {0}")]
+    #[error("JSON data is invalid")]
     Json(#[from] serde_json::Error),
 
-    #[error("TOML error: {0}")]
+    #[error("TOML configuration is invalid")]
     Toml(#[from] toml::de::Error),
 
     #[error("base64 decode error: {0}")]

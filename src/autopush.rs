@@ -1,16 +1,16 @@
 use crate::config::{AutoPushSession, WebPushKeys};
 use crate::error::{Result, AngelicAngelError};
-use crate::push;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use socket2::{SockRef, TcpKeepalive};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async_tls_with_config};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -47,10 +47,17 @@ const TCP_KEEPALIVE_SECS: u64 = 60;
 /// Sent independently of the application-level ping (5 minutes).
 const WS_PING_INTERVAL_SECS: u64 = 150;
 
+/// Bound DNS/TCP setup and TLS/WebSocket setup independently.
+const CONNECT_TIMEOUT_SECS: u64 = 15;
+/// A stalled write must force reconnect rather than hang the collector.
+const WRITE_TIMEOUT_SECS: u64 = 10;
+/// Bound allocations before protocol parsing and the tighter ciphertext limit.
+const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 1024 * 1024;
+
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Result of a new AutoPush registration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AutoPushRegistration {
     pub uaid: String,
     pub channel_id: String,
@@ -58,7 +65,7 @@ pub struct AutoPushRegistration {
 }
 
 /// Information returned when re-registration is needed (includes freshly generated keys).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReregistrationInfo {
     pub registration: AutoPushRegistration,
     /// Freshly generated keys (Firefox: ensureCrypto() always creates new keys on re-subscribe).
@@ -66,7 +73,7 @@ pub struct ReregistrationInfo {
 }
 
 /// A received push notification.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Notification {
     pub channel_id: String,
     pub version: String,
@@ -74,24 +81,17 @@ pub struct Notification {
     pub headers: Option<HashMap<String, String>>,
 }
 
-/// Maximum number of recent message IDs to track for duplicate detection (Firefox-compatible).
-const MAX_RECENT_MESSAGE_IDS: usize = 100;
-
 pub struct AutoPushClient {
     ws: WsStream,
     #[allow(dead_code)]
     uaid: String,
     #[allow(dead_code)]
     channel_id: String,
-    /// Ordered queue for duplicate detection (maintains insertion order for eviction).
-    recent_message_ids: std::collections::VecDeque<String>,
-    /// O(1) lookup set for duplicate detection.
-    recent_message_ids_set: HashSet<String>,
 }
 
 // --- AutoPush protocol message types ---
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "messageType")]
 enum AutoPushMessage {
     #[serde(rename = "hello")]
@@ -133,7 +133,7 @@ pub enum AckCode {
     NotDelivered = 102,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 struct AckUpdate {
     #[serde(rename = "channelID")]
     channel_id: String,
@@ -142,15 +142,17 @@ struct AckUpdate {
     code: u16,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 #[serde(tag = "messageType")]
 enum AutoPushResponse {
     #[serde(rename = "hello")]
     Hello {
         status: u16,
         uaid: String,
+        #[allow(dead_code)]
         #[serde(default)]
         use_webpush: Option<bool>,
+        #[allow(dead_code)]
         #[serde(default)]
         broadcasts: Option<HashMap<String, String>>,
     },
@@ -181,6 +183,40 @@ enum PongWaitResult {
     NotificationReceived(Notification),
     ConnectionClosed,
     Timeout,
+}
+
+// Parser and transport diagnostics can echo untrusted server text, URLs, headers,
+// or payloads. Never propagate their Display/Debug implementations to callers.
+fn websocket_error(_: tokio_tungstenite::tungstenite::Error) -> AngelicAngelError {
+    AngelicAngelError::AutoPush("WebSocket transport failed".to_string())
+}
+
+async fn send_ws(ws: &mut WsStream, message: Message) -> Result<()> {
+    // A timeout can leave a partially written frame. Every caller returns its
+    // error and discards the connection rather than reusing that stream.
+    tokio::time::timeout(Duration::from_secs(WRITE_TIMEOUT_SECS), ws.send(message))
+        .await
+        .map_err(|_| AngelicAngelError::AutoPush("WebSocket send timed out".to_string()))?
+        .map_err(websocket_error)
+}
+
+async fn close_ws(ws: &mut WsStream) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(WRITE_TIMEOUT_SECS), ws.close(None))
+        .await
+        .map_err(|_| AngelicAngelError::AutoPush("WebSocket close timed out".to_string()))?
+        .map_err(websocket_error)
+}
+
+fn parse_response(text: &str) -> Result<AutoPushResponse> {
+    serde_json::from_str(text).map_err(|_| {
+        AngelicAngelError::AutoPush("invalid AutoPush protocol response".to_string())
+    })
+}
+
+fn serialize_message(message: &AutoPushMessage) -> Result<String> {
+    serde_json::to_string(message).map_err(|_| {
+        AngelicAngelError::AutoPush("failed to serialize AutoPush message".to_string())
+    })
 }
 
 /// Determines if a text message is an application-level pong.
@@ -216,7 +252,7 @@ fn is_backoff_close(frame: &Option<tokio_tungstenite::tungstenite::protocol::Clo
 async fn connect_ws(url: &str) -> Result<WsStream> {
     let mut request = url
         .into_client_request()
-        .map_err(|e| AngelicAngelError::AutoPush(format!("failed to build request: {}", e)))?;
+        .map_err(|_| AngelicAngelError::AutoPush("failed to build AutoPush request".to_string()))?;
     request.headers_mut().insert(
         "User-Agent",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:134.0) Gecko/20100101 Firefox/134.0"
@@ -235,26 +271,38 @@ async fn connect_ws(url: &str) -> Result<WsStream> {
     let port = uri.port_u16().unwrap_or(443);
     let addr = format!("{}:{}", host, port);
 
-    let tcp_stream = TcpStream::connect(&addr)
+    let tcp_stream = tokio::time::timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(&addr),
+    )
         .await
-        .map_err(|e| AngelicAngelError::AutoPush(format!("TCP connect failed ({}): {}", addr, e)))?;
+        .map_err(|_| AngelicAngelError::AutoPush("AutoPush TCP connection timed out".to_string()))?
+        .map_err(|_| AngelicAngelError::AutoPush("AutoPush TCP connection failed".to_string()))?;
 
     let sock_ref = SockRef::from(&tcp_stream);
     let keepalive = TcpKeepalive::new().with_time(Duration::from_secs(TCP_KEEPALIVE_SECS));
     sock_ref
         .set_tcp_keepalive(&keepalive)
-        .map_err(|e| AngelicAngelError::AutoPush(format!("failed to set TCP keepalive: {}", e)))?;
-    tcp_stream.set_nodelay(true)?;
+        .map_err(|_| AngelicAngelError::AutoPush("failed to set TCP keepalive".to_string()))?;
+    tcp_stream.set_nodelay(true)
+        .map_err(|_| AngelicAngelError::AutoPush("failed to set TCP nodelay".to_string()))?;
 
     debug!(
-        "TCP connection established: {} (keepalive={}s, nodelay=true)",
-        addr, TCP_KEEPALIVE_SECS
+        "TCP connection established (keepalive={}s, nodelay=true)",
+        TCP_KEEPALIVE_SECS
     );
 
     // TLS + WebSocket handshake (connector: None = rustls via rustls-tls-webpki-roots feature).
-    let (ws, _response) = client_async_tls_with_config(request, tcp_stream, None, None)
+    let mut websocket_config = WebSocketConfig::default();
+    websocket_config.max_message_size = Some(MAX_WEBSOCKET_MESSAGE_BYTES);
+    websocket_config.max_frame_size = Some(MAX_WEBSOCKET_MESSAGE_BYTES);
+    let (ws, _response) = tokio::time::timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        client_async_tls_with_config(request, tcp_stream, Some(websocket_config), None),
+    )
         .await
-        .map_err(|e| AngelicAngelError::AutoPush(format!("WebSocket connect failed: {}", e)))?;
+        .map_err(|_| AngelicAngelError::AutoPush("AutoPush TLS/WebSocket handshake timed out".to_string()))?
+        .map_err(websocket_error)?;
 
     debug!("WebSocket connection established (TLS + keepalive)");
     Ok(ws)
@@ -273,21 +321,20 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
         use_webpush: true,
         broadcasts: HashMap::new(),
     };
-    let hello_json = serde_json::to_string(&hello_msg)?;
-    ws.send(Message::Text(hello_json.into())).await?;
+    let hello_json = serialize_message(&hello_msg)?;
+    send_ws(&mut ws, Message::Text(hello_json.into())).await?;
 
     debug!("hello sent");
 
     // 2. Receive hello response (timeout: 10s, matching Firefox requestTimeout)
     let uaid = match tokio::time::timeout(Duration::from_secs(PONG_TIMEOUT_SECS), ws.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => {
-            let resp: AutoPushResponse = serde_json::from_str(&text)?;
+            let resp: AutoPushResponse = parse_response(&text)?;
             match resp {
                 AutoPushResponse::Hello {
                     status,
                     uaid,
-                    use_webpush,
-                    broadcasts,
+                    ..
                 } => {
                     if status != 200 {
                         return Err(AngelicAngelError::AutoPush(format!(
@@ -295,12 +342,7 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
                             status
                         )));
                     }
-                    debug!(
-                        ?use_webpush,
-                        ?broadcasts,
-                        "hello response extra fields"
-                    );
-                    info!("hello succeeded: uaid={}", uaid);
+                    info!("hello succeeded");
                     uaid
                 }
                 _ => {
@@ -310,13 +352,12 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
                 }
             }
         }
-        Ok(Some(Ok(msg))) => {
-            return Err(AngelicAngelError::AutoPush(format!(
-                "unexpected message type: {:?}",
-                msg
-            )));
+        Ok(Some(Ok(_))) => {
+            return Err(AngelicAngelError::AutoPush(
+                "unexpected WebSocket message type".to_string(),
+            ));
         }
-        Ok(Some(Err(e))) => return Err(e.into()),
+        Ok(Some(Err(e))) => return Err(websocket_error(e)),
         Ok(None) => {
             return Err(AngelicAngelError::AutoPush(
                 "connection closed by server".to_string(),
@@ -335,16 +376,16 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
         channel_id: channel_id.clone(),
         key: Some(URL_SAFE_NO_PAD.encode(TWITTER_VAPID_PUBLIC_KEY)),
     };
-    let register_json = serde_json::to_string(&register_msg)?;
-    ws.send(Message::Text(register_json.into())).await?;
+    let register_json = serialize_message(&register_msg)?;
+    send_ws(&mut ws, Message::Text(register_json.into())).await?;
 
-    debug!("register sent: channel_id={}", channel_id);
+    debug!("register sent");
 
     // 4. Receive register response (timeout: 10s)
     let endpoint =
         match tokio::time::timeout(Duration::from_secs(PONG_TIMEOUT_SECS), ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
-                let resp: AutoPushResponse = serde_json::from_str(&text)?;
+                let resp: AutoPushResponse = parse_response(&text)?;
                 match resp {
                     AutoPushResponse::Register {
                         status,
@@ -357,7 +398,7 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
                                 status
                             )));
                         }
-                        info!("register succeeded: endpoint={}", push_endpoint);
+                        info!("register succeeded");
                         push_endpoint
                     }
                     _ => {
@@ -367,13 +408,12 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
                     }
                 }
             }
-            Ok(Some(Ok(msg))) => {
-                return Err(AngelicAngelError::AutoPush(format!(
-                    "unexpected message type: {:?}",
-                    msg
-                )));
+            Ok(Some(Ok(_))) => {
+                return Err(AngelicAngelError::AutoPush(
+                    "unexpected WebSocket message type".to_string(),
+                ));
             }
-            Ok(Some(Err(e))) => return Err(e.into()),
+            Ok(Some(Err(e))) => return Err(websocket_error(e)),
             Ok(None) => {
                 return Err(AngelicAngelError::AutoPush(
                     "connection closed by server".to_string(),
@@ -387,7 +427,7 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
         };
 
     // 5. Disconnect
-    ws.close(None).await?;
+    close_ws(&mut ws).await?;
 
     Ok(AutoPushRegistration {
         uaid,
@@ -400,22 +440,20 @@ pub async fn register_new(_keys: &WebPushKeys) -> Result<AutoPushRegistration> {
 pub enum ConnectResult {
     /// Connected successfully with the existing session.
     Connected(AutoPushClient),
-    /// UAID was invalidated; includes fresh keys and a new registration for the caller
-    /// to propagate to Twitter API and persist.
+    /// Legacy API variant. Passive listening never creates a new registration.
+    #[allow(dead_code)]
     NeedsReregistration(ReregistrationInfo),
 }
 
 /// Reconnects to AutoPush with an existing session.
 ///
-/// If the server assigns a different UAID (pushsubscriptionchange equivalent):
-/// 1. Generates a fresh P-256 key pair and auth secret (Firefox: ensureCrypto()).
-/// 2. Registers a new channel with the new UAID.
-/// 3. Returns `NeedsReregistration` so the caller can update Twitter API and save.
+/// If the server assigns a different UAID, fail closed. Creating another push
+/// registration and updating X require an explicit operator registration command.
 pub async fn connect_and_listen(
     session: &AutoPushSession,
     _keys: &WebPushKeys,
 ) -> Result<ConnectResult> {
-    info!("reconnecting to AutoPush: uaid={}", session.uaid);
+    info!("reconnecting to AutoPush");
 
     let mut ws = connect_ws(AUTOPUSH_WS_URL).await?;
 
@@ -426,21 +464,20 @@ pub async fn connect_and_listen(
         use_webpush: true,
         broadcasts: HashMap::new(),
     };
-    let hello_json = serde_json::to_string(&hello_msg)?;
-    ws.send(Message::Text(hello_json.into())).await?;
+    let hello_json = serialize_message(&hello_msg)?;
+    send_ws(&mut ws, Message::Text(hello_json.into())).await?;
 
     debug!("hello sent (reconnect)");
 
     // Receive hello response (timeout: 10s).
     match tokio::time::timeout(Duration::from_secs(PONG_TIMEOUT_SECS), ws.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => {
-            let resp: AutoPushResponse = serde_json::from_str(&text)?;
+            let resp: AutoPushResponse = parse_response(&text)?;
             match resp {
                 AutoPushResponse::Hello {
                     status,
                     uaid,
-                    use_webpush,
-                    broadcasts,
+                    ..
                 } => {
                     if status != 200 {
                         return Err(AngelicAngelError::AutoPush(format!(
@@ -448,34 +485,14 @@ pub async fn connect_and_listen(
                             status
                         )));
                     }
-                    debug!(
-                        ?use_webpush,
-                        ?broadcasts,
-                        "hello response extra fields"
-                    );
                     if uaid != session.uaid {
-                        warn!(
-                            old_uaid = %session.uaid,
-                            new_uaid = %uaid,
-                            "UAID invalidated, generating new keys and re-registering"
-                        );
-
-                        let _ = ws.close(None).await;
-
-                        // Generate fresh keys (Firefox: ensureCrypto() on re-subscribe).
-                        let new_keys = push::generate_keys();
-                        info!("generated new encryption keys");
-
-                        let registration = register_new(&new_keys).await?;
-
-                        info!(new_uaid = %registration.uaid, "re-registration complete");
-
-                        return Ok(ConnectResult::NeedsReregistration(ReregistrationInfo {
-                            registration,
-                            keys: new_keys,
-                        }));
+                        warn!("UAID invalid; explicit re-registration required");
+                        let _ = close_ws(&mut ws).await;
+                        return Err(AngelicAngelError::AutoPush(
+                            "UAID invalid; explicit re-registration required".to_string(),
+                        ));
                     }
-                    info!("hello succeeded (reconnect): uaid={}", uaid);
+                    info!("hello succeeded (reconnect)");
                 }
                 _ => {
                     return Err(AngelicAngelError::AutoPush(
@@ -484,13 +501,12 @@ pub async fn connect_and_listen(
                 }
             }
         }
-        Ok(Some(Ok(msg))) => {
-            return Err(AngelicAngelError::AutoPush(format!(
-                "unexpected message type: {:?}",
-                msg
-            )));
+        Ok(Some(Ok(_))) => {
+            return Err(AngelicAngelError::AutoPush(
+                "unexpected WebSocket message type".to_string(),
+            ));
         }
-        Ok(Some(Err(e))) => return Err(e.into()),
+        Ok(Some(Err(e))) => return Err(websocket_error(e)),
         Ok(None) => {
             return Err(AngelicAngelError::AutoPush(
                 "connection closed by server".to_string(),
@@ -507,8 +523,6 @@ pub async fn connect_and_listen(
         ws,
         uaid: session.uaid.clone(),
         channel_id: session.channel_id.clone(),
-        recent_message_ids: std::collections::VecDeque::new(),
-        recent_message_ids_set: HashSet::new(),
     }))
 }
 
@@ -542,7 +556,7 @@ impl AutoPushClient {
                                 continue;
                             }
 
-                            let resp: AutoPushResponse = serde_json::from_str(&text)?;
+                            let resp: AutoPushResponse = parse_response(&text)?;
                             match resp {
                                 AutoPushResponse::Notification {
                                     channel_id,
@@ -550,31 +564,9 @@ impl AutoPushClient {
                                     data,
                                     headers,
                                 } => {
-                                    // Duplicate detection (track last 100 message IDs).
-                                    if self.recent_message_ids_set.contains(&version) {
-                                        warn!(version = %version, "duplicate notification detected, skipping");
-                                        // Still ACK duplicates so the server stops retrying.
-                                        self.ack_notification(
-                                            channel_id,
-                                            version,
-                                            AckCode::Delivered,
-                                        )
-                                        .await?;
-                                        continue;
-                                    }
-                                    if self.recent_message_ids.len() >= MAX_RECENT_MESSAGE_IDS {
-                                        if let Some(old) = self.recent_message_ids.pop_front() {
-                                            self.recent_message_ids_set.remove(&old);
-                                        }
-                                    }
-                                    self.recent_message_ids.push_back(version.clone());
-                                    self.recent_message_ids_set.insert(version.clone());
-
-                                    info!(
-                                        channel_id = %channel_id,
-                                        version = %version,
-                                        "notification received"
-                                    );
+                                    // Every notification reaches durable deduplication before
+                                    // its caller ACKs, including upstream retransmissions.
+                                    info!("notification received");
                                     return Ok(Some(Notification {
                                         channel_id,
                                         version,
@@ -582,15 +574,15 @@ impl AutoPushClient {
                                         headers,
                                     }));
                                 }
-                                other => {
-                                    debug!(?other, "non-notification message received");
+                                _ => {
+                                    debug!("non-notification message received");
                                     continue;
                                 }
                             }
                         }
                         Some(Ok(Message::Ping(data))) => {
                             debug!("WebSocket ping received, sending pong");
-                            self.ws.send(Message::Pong(data)).await?;
+                            send_ws(&mut self.ws, Message::Pong(data)).await?;
                             continue;
                         }
                         Some(Ok(Message::Pong(_))) => {
@@ -607,12 +599,12 @@ impl AutoPushClient {
                             info!("WebSocket closed by server");
                             return Ok(None);
                         }
-                        Some(Ok(msg)) => {
-                            debug!(?msg, "unexpected message type");
+                        Some(Ok(_)) => {
+                            debug!("unexpected message type");
                             continue;
                         }
                         Some(Err(e)) => {
-                            return Err(e.into());
+                            return Err(websocket_error(e));
                         }
                         None => {
                             info!("WebSocket stream ended");
@@ -629,7 +621,7 @@ impl AutoPushClient {
                             idle_secs = PING_INTERVAL_SECS,
                             "sending application-level ping"
                         );
-                        self.ws.send(Message::Text("{}".into())).await?;
+                        send_ws(&mut self.ws, Message::Text("{}".into())).await?;
 
                         match self.wait_for_pong_or_notification().await? {
                             PongWaitResult::PongReceived => {
@@ -659,7 +651,7 @@ impl AutoPushClient {
                     } else {
                         // WebSocket Ping frame timer (RFC 6455 Section 5.5.2).
                         debug!(interval_secs = WS_PING_INTERVAL_SECS, "sending WebSocket ping frame");
-                        self.ws.send(Message::Ping(vec![].into())).await?;
+                        send_ws(&mut self.ws, Message::Ping(vec![].into())).await?;
                         next_ws_ping = Instant::now() + Duration::from_secs(WS_PING_INTERVAL_SECS);
                     }
                 }
@@ -685,18 +677,14 @@ impl AutoPushClient {
                     if is_pong(&text) {
                         return Ok(PongWaitResult::PongReceived);
                     }
-                    match serde_json::from_str::<AutoPushResponse>(&text) {
+                    match parse_response(&text) {
                         Ok(AutoPushResponse::Notification {
                             channel_id,
                             version,
                             data,
                             headers,
                         }) => {
-                            info!(
-                                channel_id = %channel_id,
-                                version = %version,
-                                "notification received while waiting for pong"
-                            );
+                            info!("notification received while waiting for pong");
                             return Ok(PongWaitResult::NotificationReceived(Notification {
                                 channel_id,
                                 version,
@@ -704,16 +692,16 @@ impl AutoPushClient {
                                 headers,
                             }));
                         }
-                        Ok(other) => {
-                            debug!(?other, "non-notification message while waiting for pong");
+                        Ok(_) => {
+                            debug!("non-notification message while waiting for pong");
                             continue;
                         }
-                        Err(e) => return Err(e.into()),
+                        Err(e) => return Err(e),
                     }
                 }
                 Ok(Some(Ok(Message::Ping(data)))) => {
                     debug!("WebSocket ping received while waiting for pong, sending pong");
-                    self.ws.send(Message::Pong(data)).await?;
+                    send_ws(&mut self.ws, Message::Pong(data)).await?;
                     continue;
                 }
                 Ok(Some(Ok(Message::Close(frame)))) => {
@@ -729,7 +717,7 @@ impl AutoPushClient {
                     return Ok(PongWaitResult::ConnectionClosed);
                 }
                 Ok(Some(Ok(_))) => continue,
-                Ok(Some(Err(e))) => return Err(e.into()),
+                Ok(Some(Err(e))) => return Err(websocket_error(e)),
                 Err(_) => return Ok(PongWaitResult::Timeout),
             }
         }
@@ -749,8 +737,8 @@ impl AutoPushClient {
                 code: code as u16,
             }],
         };
-        let ack_json = serde_json::to_string(&ack_msg)?;
-        self.ws.send(Message::Text(ack_json.into())).await?;
+        let ack_json = serialize_message(&ack_msg)?;
+        send_ws(&mut self.ws, Message::Text(ack_json.into())).await?;
         debug!(code = code as u16, "ACK sent");
         Ok(())
     }
@@ -768,11 +756,7 @@ impl AutoPushClient {
 
 /// Unregisters a channel from AutoPush.
 pub async fn unregister(session: &AutoPushSession) -> Result<()> {
-    info!(
-        uaid = %session.uaid,
-        channel_id = %session.channel_id,
-        "starting AutoPush unregistration"
-    );
+    info!("starting AutoPush unregistration");
 
     let mut ws = connect_ws(AUTOPUSH_WS_URL).await?;
 
@@ -783,24 +767,24 @@ pub async fn unregister(session: &AutoPushSession) -> Result<()> {
         use_webpush: true,
         broadcasts: HashMap::new(),
     };
-    let hello_json = serde_json::to_string(&hello_msg)?;
-    ws.send(Message::Text(hello_json.into())).await?;
+    let hello_json = serialize_message(&hello_msg)?;
+    send_ws(&mut ws, Message::Text(hello_json.into())).await?;
 
     debug!("hello sent (unregister)");
 
     // 2. Receive hello response (timeout: 10s).
     match tokio::time::timeout(Duration::from_secs(PONG_TIMEOUT_SECS), ws.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => {
-            let resp: AutoPushResponse = serde_json::from_str(&text)?;
+            let resp: AutoPushResponse = parse_response(&text)?;
             match resp {
-                AutoPushResponse::Hello { status, uaid, .. } => {
+                AutoPushResponse::Hello { status, .. } => {
                     if status != 200 {
                         return Err(AngelicAngelError::AutoPush(format!(
                             "hello failed (unregister): status={}",
                             status
                         )));
                     }
-                    info!("hello succeeded (unregister): uaid={}", uaid);
+                    info!("hello succeeded (unregister)");
                 }
                 _ => {
                     return Err(AngelicAngelError::AutoPush(
@@ -809,13 +793,12 @@ pub async fn unregister(session: &AutoPushSession) -> Result<()> {
                 }
             }
         }
-        Ok(Some(Ok(msg))) => {
-            return Err(AngelicAngelError::AutoPush(format!(
-                "unexpected message type: {:?}",
-                msg
-            )));
+        Ok(Some(Ok(_))) => {
+            return Err(AngelicAngelError::AutoPush(
+                "unexpected WebSocket message type".to_string(),
+            ));
         }
-        Ok(Some(Err(e))) => return Err(e.into()),
+        Ok(Some(Err(e))) => return Err(websocket_error(e)),
         Ok(None) => {
             return Err(AngelicAngelError::AutoPush(
                 "connection closed by server".to_string(),
@@ -833,14 +816,45 @@ pub async fn unregister(session: &AutoPushSession) -> Result<()> {
         channel_id: session.channel_id.clone(),
         code: 200,
     };
-    let unregister_json = serde_json::to_string(&unregister_msg)?;
-    ws.send(Message::Text(unregister_json.into())).await?;
+    let unregister_json = serialize_message(&unregister_msg)?;
+    send_ws(&mut ws, Message::Text(unregister_json.into())).await?;
 
-    debug!(channel_id = %session.channel_id, "unregister sent");
+    debug!("unregister sent");
 
     // 4. Disconnect.
-    ws.close(None).await?;
+    close_ws(&mut ws).await?;
 
     info!("AutoPush unregistration complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_parse_errors_do_not_echo_server_text() {
+        let error = parse_response(r#"{"messageType":"synthetic-private-server-value"}"#)
+            .err().unwrap();
+        assert!(!error.to_string().contains("synthetic-private"));
+        assert!(!format!("{:?}", error).contains("synthetic-private"));
+    }
+
+    #[test]
+    fn websocket_errors_do_not_echo_transport_text() {
+        let transport = tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::new(std::io::ErrorKind::Other, "synthetic-private-transport-value"),
+        );
+        let error = websocket_error(transport);
+        assert!(!error.to_string().contains("synthetic-private"));
+        assert!(!format!("{:?}", error).contains("synthetic-private"));
+    }
+
+    #[test]
+    fn duplicate_notifications_are_not_filtered_by_protocol_parsing() {
+        let wire = r#"{"messageType":"notification","channelID":"test-channel","version":"test-version","data":"test-payload"}"#;
+        for _ in 0..2 {
+            assert!(matches!(parse_response(wire), Ok(AutoPushResponse::Notification { .. })));
+        }
+    }
 }
