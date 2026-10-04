@@ -1,8 +1,11 @@
 mod autopush;
 mod cli;
 mod config;
+mod delivery;
 mod error;
+mod filter;
 mod listener;
+mod outbox;
 mod push;
 mod twitter;
 
@@ -12,7 +15,7 @@ use clap::Parser;
 use cli::{Cli, Commands};
 use config::Config;
 use console::style;
-use dialoguer::{Input, Password};
+use dialoguer::Password;
 use error::Result;
 use indicatif::ProgressBar;
 use tracing_subscriber::EnvFilter;
@@ -22,31 +25,34 @@ async fn main() {
     let cli = Cli::parse();
 
     let filter = if cli.verbose {
-        EnvFilter::new("debug")
+        EnvFilter::new("off,angelic_angel=debug")
     } else {
-        EnvFilter::new("warn")
+        EnvFilter::new("off,angelic_angel=info")
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config_path = cli.config;
 
+    let listener_handles_shutdown = matches!(&cli.command, Commands::Listen { .. });
     let task = async {
         match cli.command {
-            Commands::Init { auth_token, ct0 } => cmd_init(&config_path, auth_token, ct0).await,
+            Commands::Init => cmd_init(&config_path).await,
             Commands::Register => cmd_register(&config_path).await,
-            Commands::Listen => cmd_listen(&config_path).await,
+            Commands::Listen { outbox, type_pointer, allow_type } =>
+                cmd_listen(&config_path, outbox, type_pointer, allow_type).await,
+            Commands::QueueStatus { outbox } => cmd_queue_status(outbox).await,
             Commands::Status => cmd_status(&config_path).await,
             Commands::Unregister => cmd_unregister(&config_path).await,
         }
     };
 
-    let result = tokio::select! {
+    let result = if listener_handles_shutdown { task.await } else { tokio::select! {
         result = task => result,
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n{}", style("Interrupted").red().bold());
             return;
         }
-    };
+    }};
 
     if let Err(e) = result {
         eprintln!("{} {}", style("error:").red().bold(), e);
@@ -83,29 +89,19 @@ where
     }
 }
 
-async fn cmd_init(
-    config_path: &PathBuf,
-    arg_auth_token: Option<String>,
-    arg_ct0: Option<String>,
-) -> Result<()> {
+async fn cmd_init(config_path: &PathBuf) -> Result<()> {
     eprintln!("{}", style("Initializing configuration").bold());
     eprintln!();
 
-    let auth_token = match arg_auth_token {
-        Some(v) => v,
-        None => Password::new()
+    let auth_token = Password::new()
             .with_prompt("auth_token")
             .interact()
-            .map_err(|e| error::AngelicAngelError::Config(format!("input error: {}", e)))?,
-    };
+            .map_err(|_| error::AngelicAngelError::Config("credential input failed".into()))?;
 
-    let ct0 = match arg_ct0 {
-        Some(v) => v,
-        None => Input::new()
+    let ct0 = Password::new()
             .with_prompt("ct0")
-            .interact_text()
-            .map_err(|e| error::AngelicAngelError::Config(format!("input error: {}", e)))?,
-    };
+            .interact()
+            .map_err(|_| error::AngelicAngelError::Config("credential input failed".into()))?;
 
     let config = Config {
         twitter: config::TwitterConfig { auth_token, ct0 },
@@ -127,6 +123,8 @@ async fn cmd_register(config_path: &PathBuf) -> Result<()> {
     eprintln!();
 
     let mut config = Config::load(config_path)?;
+    // Check before creating any remote AutoPush registration.
+    twitter::validate_credentials(&config.twitter)?;
 
     let subscription = spin(
         "Registering with AutoPush...",
@@ -159,7 +157,10 @@ async fn cmd_register(config_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_listen(config_path: &PathBuf) -> Result<()> {
+async fn cmd_listen(
+    config_path: &PathBuf, outbox: PathBuf, type_pointer: String, allow_type: Vec<String>,
+) -> Result<()> {
+    let filter = filter::NotificationFilter::new(type_pointer, allow_type)?;
     let config = Config::load(config_path)?;
     let registration = config.registration.ok_or_else(|| {
         error::AngelicAngelError::Config(
@@ -167,10 +168,21 @@ async fn cmd_listen(config_path: &PathBuf) -> Result<()> {
         )
     })?;
 
-    tracing::info!(config = %config_path.display(), "config loaded, starting listener");
+    // Cookies are not needed after explicit registration and are never sent here.
+    listener::listen(registration, outbox, filter).await?;
 
-    listener::listen(registration, config_path).await?;
+    Ok(())
+}
 
+async fn cmd_queue_status(path: PathBuf) -> Result<()> {
+    // Fails if an active process owns the queue; live health is logged every 30s.
+    if !path.is_dir() {
+        return Err(error::AngelicAngelError::Config("outbox directory does not exist".into()));
+    }
+    let snapshot = tokio::task::spawn_blocking(move || {
+        outbox::Outbox::open(path).map(|queue| queue.snapshot())
+    }).await.map_err(|_| error::AngelicAngelError::BackgroundTask)??;
+    println!("{}", serde_json::to_string_pretty(&snapshot)?);
     Ok(())
 }
 
@@ -182,25 +194,20 @@ async fn cmd_status(config_path: &PathBuf) -> Result<()> {
         Ok(config) => {
             eprintln!("{}  {}", style("Config").cyan().bold(), style(config_path.display()).dim());
             eprintln!(
-                "  auth_token  {}...",
-                style(&config.twitter.auth_token.chars().take(20).collect::<String>()).dim()
+                "  auth_token  {}",
+                style(if config.twitter.auth_token.is_empty() { "unset" } else { "configured (redacted)" }).dim()
             );
             eprintln!(
-                "  ct0         {}...",
-                style(&config.twitter.ct0.chars().take(20).collect::<String>()).dim()
+                "  ct0         {}",
+                style(if config.twitter.ct0.is_empty() { "unset" } else { "configured (redacted)" }).dim()
             );
 
             eprintln!();
 
             match config.registration {
-                Some(reg) => {
-                    eprintln!("{}  {}", style("Registration").cyan().bold(), style("active").green());
-                    eprintln!(
-                        "  endpoint    {}...",
-                        style(&reg.endpoint.chars().take(50).collect::<String>()).dim()
-                    );
-                    eprintln!("  uaid        {}", style(&reg.autopush.uaid).dim());
-                    eprintln!("  channel_id  {}", style(&reg.autopush.channel_id).dim());
+                Some(_) => {
+                    eprintln!("{}  {}", style("Registration").cyan().bold(), style("saved (not checked live)").green());
+                    eprintln!("  endpoint / session / keys: configured (redacted)");
                 }
                 None => {
                     eprintln!(
@@ -215,17 +222,7 @@ async fn cmd_status(config_path: &PathBuf) -> Result<()> {
                 }
             }
         }
-        Err(_) => {
-            eprintln!(
-                "{}  {}",
-                style("Config").cyan().bold(),
-                style("not found").red()
-            );
-            eprintln!(
-                "  Run {} to initialize.",
-                style("angelic-angel init").bold()
-            );
-        }
+        Err(error) => return Err(error),
     }
 
     Ok(())

@@ -22,19 +22,27 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Initialize config file (interactive if no arguments given)
-    Init {
-        /// Twitter auth_token
-        #[arg(long)]
-        auth_token: Option<String>,
-        /// Twitter ct0 (CSRF token)
-        #[arg(long)]
-        ct0: Option<String>,
-    },
+    /// Initialize config interactively with hidden input (never pass cookies in argv)
+    Init,
     /// Register AutoPush subscription and Twitter Push endpoint
     Register,
-    /// Start listening for push notifications
-    Listen,
+    /// Receive selected notification types into a durable outbox and deliver them
+    Listen {
+        /// Private local filesystem directory, dedicated to one webhook destination
+        #[arg(long, default_value = "state/outbox")]
+        outbox: PathBuf,
+        /// JSON pointer to the type field, verified using a synthetic fixture
+        #[arg(long)]
+        type_pointer: String,
+        /// Exact allowed type values; unknown or non-string types are discarded
+        #[arg(long, required = true, value_delimiter = ',')]
+        allow_type: Vec<String>,
+    },
+    /// Read durable queue health while the listener is stopped (never prints payloads)
+    QueueStatus {
+        #[arg(long, default_value = "state/outbox")]
+        outbox: PathBuf,
+    },
     /// Show current config and registration status
     Status,
     /// Unregister AutoPush subscription

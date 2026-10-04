@@ -1,279 +1,199 @@
 use crate::autopush::{self, ConnectResult};
 use crate::config::{self, Registration};
-use crate::error::{Result, AngelicAngelError};
-use crate::twitter;
-use reqwest::Client;
-use std::path::Path;
+use crate::delivery::{DeliveryConfig, DeliveryWorker};
+use crate::error::{AngelicAngelError, Result};
+use crate::filter::NotificationFilter;
+use crate::outbox::{self, Outbox, SharedOutbox};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex, watch};
 
-/// Outcome of a single listen session.
-///
-/// Follows the design of Firefox's PushServiceWebSocket.sys.mjs, explicitly
-/// distinguishing whether the connection was ever established. Firefox resets
-/// _retryFailCount to 0 on any message receipt (including the hello response),
-/// so we need to know if hello succeeded to mirror that behavior.
-enum SessionOutcome {
-    /// WebSocket closed normally (connection was established).
-    NormalClose,
-    /// Disconnected after a successful handshake (hello succeeded, then a WebSocket error).
-    DisconnectedAfterConnect(AngelicAngelError),
-    /// Failed before establishing a connection (hello never completed).
-    ConnectionFailed(AngelicAngelError),
-    /// Unrecoverable error (e.g. UAID invalidated and re-registration also failed).
-    Fatal(AngelicAngelError),
-}
-
-/// Computes an exponential backoff delay compatible with Firefox's implementation.
-///
-/// Firefox (PushServiceWebSocket.sys.mjs L408-431):
-///   retryTimeout = retryBaseInterval * 2^retryFailCount
-///   retryTimeout = min(retryTimeout, pingInterval)
-///
-/// - retryBaseInterval = 5s  (dom.push.retryBaseInterval = 5000)
-/// - pingInterval      = 5m  (capped; Firefox uses 30m but we use a shorter ping interval)
 fn calc_backoff(retry_count: u32) -> u64 {
-    const RETRY_BASE_INTERVAL_SECS: u64 = 5;
-    const PING_INTERVAL_SECS: u64 = 5 * 60;
-    std::cmp::min(
-        RETRY_BASE_INTERVAL_SECS.saturating_mul(2u64.saturating_pow(retry_count.saturating_sub(1))),
-        PING_INTERVAL_SECS,
-    )
+    5u64.saturating_mul(2u64.saturating_pow(retry_count.saturating_sub(1))).min(300)
 }
 
-/// Main listen loop with automatic reconnection.
-///
-/// Reconnection strategy mirrors Firefox (PushServiceWebSocket.sys.mjs):
-/// - Reset retry counter on any successful message receipt (connection established).
-/// - No upper limit on retry attempts (infinite retries).
-/// - Exponential backoff: 5s * 2^n, capped at 5 minutes.
-/// - Server-initiated backoff via close code 4774 delays reconnection for 30 minutes.
-pub async fn listen(mut registration: Registration, config_path: &Path) -> Result<()> {
-    let mut retry_count: u32 = 0;
+pub fn validate_registration(registration: &Registration) -> Result<()> {
+    let invalid = || AngelicAngelError::Config("saved push session or keys are invalid; repair explicitly before listening".into());
+    let keys = &registration.keys;
+    if keys.private_key.len() != 32 || keys.public_key.len() != 65 || keys.auth_secret.len() != 16 {
+        return Err(invalid());
+    }
+    let private = p256::SecretKey::from_slice(&keys.private_key).map_err(|_| invalid())?;
+    if private.public_key().to_sec1_bytes().as_ref() != keys.public_key.as_slice()
+        || uuid::Uuid::parse_str(&registration.autopush.uaid).is_err()
+        || uuid::Uuid::parse_str(&registration.autopush.channel_id).is_err() {
+        return Err(invalid());
+    }
+    Ok(())
+}
 
+/// Owns both tasks. Signals finish in-progress durable commits before exiting.
+/// The registered session is used as-is; expiration needs an explicit registration.
+pub async fn listen(registration: Registration, path: PathBuf, filter: NotificationFilter) -> Result<()> {
+    validate_registration(&registration)?;
+    let endpoint = config::get_webhook_endpoint()?;
+    let queue = tokio::task::spawn_blocking(move || Outbox::open(path)).await
+        .map_err(|_| AngelicAngelError::BackgroundTask)??;
+    let shared = Arc::new(Mutex::new(queue));
+    let worker = DeliveryWorker::new(shared.clone(), &endpoint, DeliveryConfig::default())?;
+    worker.bind_destination().await?;
+    let (stop, stopped) = watch::channel(false);
+    let mut source = tokio::spawn(receive_loop(registration, shared.clone(), filter, stopped.clone()));
+    let mut delivery = tokio::spawn(worker.run(stopped.clone()));
+    let mut health = tokio::spawn(report_health(shared, stopped));
+    enum Completed { Source, Delivery, Health, Signal }
+    let (completed, result) = tokio::select! {
+        result = &mut source => (Completed::Source, result.map_err(|_| AngelicAngelError::BackgroundTask).and_then(|r| r)),
+        result = &mut delivery => (Completed::Delivery, result.map_err(|_| AngelicAngelError::BackgroundTask).and_then(|r| r.map_err(Into::into))),
+        result = &mut health => (Completed::Health, result.map_err(|_| AngelicAngelError::BackgroundTask).and_then(|r| r)),
+        result = shutdown_signal() => (Completed::Signal, result),
+    };
+    let _ = stop.send(true);
+    // Never abort tasks during an atomic storage operation.
+    let source_result = if matches!(completed, Completed::Source) { Ok(()) }
+        else { source.await.map_err(|_| AngelicAngelError::BackgroundTask).and_then(|r| r) };
+    let delivery_result = if matches!(completed, Completed::Delivery) { Ok(()) }
+        else { delivery.await.map_err(|_| AngelicAngelError::BackgroundTask).and_then(|r| r.map_err(Into::into)) };
+    let health_result = if matches!(completed, Completed::Health) { Ok(()) }
+        else { health.await.map_err(|_| AngelicAngelError::BackgroundTask).and_then(|r| r) };
+    result.and(source_result).and(delivery_result).and(health_result)
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+async fn cancelled(stop: &mut watch::Receiver<bool>) {
     loop {
-        match listen_once(&mut registration, config_path).await {
-            SessionOutcome::NormalClose => {
-                retry_count = 0;
-                tracing::info!("WebSocket connection closed, reconnecting");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            SessionOutcome::DisconnectedAfterConnect(e) => {
-                if e.to_string().contains("BACKOFF:") {
-                    tracing::warn!("server requested backoff, delaying reconnect for 30 minutes");
-                    tokio::time::sleep(Duration::from_secs(30 * 60)).await;
-                } else {
-                    retry_count = 0;
-                    tracing::info!(error = %e, "disconnected after connect, reconnecting");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-            SessionOutcome::ConnectionFailed(e) => {
-                retry_count += 1;
-                let delay = calc_backoff(retry_count);
-                tracing::warn!(
-                    retry_count,
-                    delay_secs = delay,
-                    error = %e,
-                    "WebSocket connection failed, retrying"
-                );
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-            }
-            SessionOutcome::Fatal(e) => {
-                tracing::error!(error = %e, "fatal error, re-registration required");
-                return Err(e);
-            }
-        }
+        if *stop.borrow() || stop.has_changed().is_err() { return; }
+        if stop.changed().await.is_err() { return; }
     }
 }
 
-/// Runs a single listen session: connect, receive notifications, return outcome.
-async fn listen_once(registration: &mut Registration, config_path: &Path) -> SessionOutcome {
-    let mut client = match try_connect(registration, config_path).await {
-        Ok(client) => client,
-        Err(e) => {
-            if e.to_string().contains("UAID invalid")
-                || e.to_string().contains("still failed after re-registration")
-            {
-                return SessionOutcome::Fatal(e);
-            }
-            return SessionOutcome::ConnectionFailed(e);
-        }
-    };
-
-    tracing::info!("WebSocket connection established, listening for notifications");
-
-    match run_notification_loop(&mut client, registration).await {
-        Ok(()) => SessionOutcome::NormalClose,
-        Err(e) => SessionOutcome::DisconnectedAfterConnect(e),
-    }
-}
-
-/// Establishes a connection to AutoPush, handling UAID invalidation transparently.
-async fn try_connect(registration: &mut Registration, config_path: &Path) -> Result<autopush::AutoPushClient> {
-    let connect_result =
-        autopush::connect_and_listen(&registration.autopush, &registration.keys).await?;
-
-    match connect_result {
-        ConnectResult::Connected(client) => {
-            tracing::info!("connected with existing session");
-            Ok(client)
-        }
-        ConnectResult::NeedsReregistration(reregistration_info) => {
-            let new_reg = &reregistration_info.registration;
-            let new_keys = reregistration_info.keys;
-
-            tracing::warn!(
-                new_uaid = %new_reg.uaid,
-                new_channel_id = %new_reg.channel_id,
-                "UAID invalidated (pushsubscriptionchange), re-registering"
-            );
-
-            tracing::info!("re-registering with Twitter API");
-            let mut full_config = config::Config::load(config_path)?;
-
-            let subscription = crate::push::PushSubscription {
-                endpoint: new_reg.endpoint.clone(),
-                autopush: config::AutoPushSession {
-                    uaid: new_reg.uaid.clone(),
-                    channel_id: new_reg.channel_id.clone(),
-                },
-                keys: new_keys.clone(),
-            };
-
-            twitter::register(&full_config.twitter, &subscription).await?;
-            tracing::info!("Twitter API re-registration complete");
-
-            registration.endpoint = new_reg.endpoint.clone();
-            registration.autopush.uaid = new_reg.uaid.clone();
-            registration.autopush.channel_id = new_reg.channel_id.clone();
-            registration.keys = new_keys;
-            full_config.registration = Some(registration.clone());
-            full_config.save(config_path)?;
-            tracing::info!("saved updated registration");
-
-            match autopush::connect_and_listen(&registration.autopush, &registration.keys).await? {
-                ConnectResult::Connected(client) => Ok(client),
-                ConnectResult::NeedsReregistration(_) => Err(AngelicAngelError::AutoPush(
-                    "still failed after re-registration".to_string(),
-                )),
-            }
-        }
-    }
-}
-
-/// Receives and processes notifications in a loop until the connection drops.
-async fn run_notification_loop(
-    client: &mut autopush::AutoPushClient,
-    registration: &Registration,
+async fn receive_loop(
+    registration: Registration, queue: SharedOutbox, filter: NotificationFilter,
+    mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
-    while let Some(notification) = client.next_notification().await? {
-        tracing::info!(
-            channel_id = %notification.channel_id,
-            version = %notification.version,
-            "notification received"
-        );
-
-        let ack_code = if let Some(ref data) = notification.data {
-            match handle_notification_data(data, &notification.headers, &registration.keys).await {
-                Ok(()) => autopush::AckCode::Delivered,
-                Err(ref e) if is_decryption_error(e) => {
-                    tracing::warn!(error = %e, "decryption error, sending ACK with decryption_error");
-                    autopush::AckCode::DecryptionError
-                }
-                Err(ref e) => {
-                    tracing::warn!(error = %e, "notification processing error, sending ACK with not_delivered");
-                    autopush::AckCode::NotDelivered
-                }
-            }
-        } else {
-            tracing::info!("empty notification (no data)");
-            autopush::AckCode::Delivered
+    let mut retry_count: u32 = 0;
+    loop {
+        let connection = tokio::select! {
+            biased;
+            _ = cancelled(&mut stop) => return Ok(()),
+            result = tokio::time::timeout(Duration::from_secs(35),
+                autopush::connect_and_listen(&registration.autopush, &registration.keys)) =>
+                result.unwrap_or_else(|_| Err(AngelicAngelError::AutoPush("push connection timed out".into()))),
         };
-
-        client
-            .ack_notification(
-                notification.channel_id.clone(),
-                notification.version.clone(),
-                ack_code,
-            )
-            .await?;
-        tracing::debug!(
-            channel_id = %notification.channel_id,
-            ack_code = ?ack_code,
-            "ACK sent"
-        );
+        let (connected, result) = match connection {
+            Ok(ConnectResult::Connected(mut client)) => {
+                tracing::info!("push connection established");
+                (true, run_notification_loop(&mut client, &registration, queue.clone(), &filter, &mut stop).await)
+            }
+            // Kept defensive for compatibility; AutoPush no longer creates this
+            // result by automatically registering a replacement subscription.
+            Ok(ConnectResult::NeedsReregistration(_)) => {
+                return Err(AngelicAngelError::AutoPush("UAID invalid; explicit re-registration required".into()));
+            }
+            Err(error) => (false, Err(error)),
+        };
+        if let Err(AngelicAngelError::Outbox(error)) = result { return Err(error.into()); }
+        if *stop.borrow() || stop.has_changed().is_err() { return Ok(()); }
+        let delay = match result {
+            Err(ref error) if error.to_string().contains("UAID invalid") => return result,
+            Err(ref error) if error.to_string().contains("BACKOFF:") => 30 * 60,
+            _ if connected => { retry_count = 0; 1 },
+            _ => { retry_count = retry_count.saturating_add(1); calc_backoff(retry_count) },
+        };
+        // Errors from remote peers may contain untrusted data. Do not print them.
+        tracing::warn!(delay_secs = delay, "push disconnected; reconnect scheduled");
+        tokio::select! {
+            _ = cancelled(&mut stop) => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(delay)) => {},
+        }
     }
-
-    Ok(())
 }
 
-fn is_decryption_error(e: &AngelicAngelError) -> bool {
-    matches!(e, AngelicAngelError::Decryption(_))
-}
-
-async fn handle_notification_data(
-    data: &str,
-    headers: &Option<std::collections::HashMap<String, String>>,
-    keys: &crate::config::WebPushKeys,
+async fn run_notification_loop(
+    client: &mut autopush::AutoPushClient, registration: &Registration,
+    queue: SharedOutbox, filter: &NotificationFilter, stop: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let encrypted = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, data)
-        .map_err(|e| AngelicAngelError::Decryption(format!("base64 decode failed: {}", e)))?;
-
-    tracing::debug!(encrypted_size = encrypted.len(), "decoding encrypted message");
-
-    if let Some(hdrs) = headers {
-        tracing::debug!(?hdrs, "notification headers");
+    loop {
+        let notification = tokio::select! {
+            biased;
+            _ = cancelled(stop) => return Ok(()),
+            result = client.next_notification() => result?,
+        };
+        let Some(notification) = notification else { return Ok(()); };
+        if uuid::Uuid::parse_str(&notification.channel_id).ok()
+            != uuid::Uuid::parse_str(&registration.autopush.channel_id).ok() {
+            return Err(AngelicAngelError::AutoPush("notification channel does not match saved registration".into()));
+        }
+        let ack_code = match &notification.data {
+            Some(data) => match decode_notification(data, &notification.headers, &registration.keys) {
+                Ok(payload) if filter.accepts(&payload) => {
+                    // Do not race this future against shutdown. A failed/uncertain
+                    // commit exits without ANY ACK, allowing upstream redelivery.
+                    outbox::enqueue_durable(queue.clone(), notification.channel_id.clone(),
+                        notification.version.clone(), payload).await?;
+                    autopush::AckCode::Delivered
+                },
+                Ok(_) => {
+                    tracing::info!("notification intentionally excluded by type allowlist");
+                    autopush::AckCode::Delivered
+                },
+                Err(_) => {
+                    tracing::warn!("notification could not be decrypted or parsed");
+                    autopush::AckCode::DecryptionError
+                },
+            },
+            None => autopush::AckCode::Delivered,
+        };
+        tokio::time::timeout(Duration::from_secs(10), client.ack_notification(
+            notification.channel_id, notification.version, ack_code)).await
+            .map_err(|_| AngelicAngelError::AutoPush("ACK timed out".into()))??;
     }
-
-    let decrypted = match decrypt_ece(&encrypted, headers, keys) {
-        Ok(decrypted) => {
-            tracing::debug!(decrypted_size = decrypted.len(), "ECE decryption succeeded");
-            decrypted
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                encrypted_head = ?&encrypted[..encrypted.len().min(16)],
-                "ECE decryption failed"
-            );
-            return Err(e);
-        }
-    };
-
-    let text = String::from_utf8(decrypted)
-        .map_err(|e| AngelicAngelError::Decryption(format!("UTF-8 conversion failed: {}", e)))?;
-
-    let payload: serde_json::Value =
-        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }));
-
-    tracing::info!(payload = %payload, "notification decrypted");
-
-    send_to_webhook(&payload).await?;
-
-    Ok(())
 }
 
-/// Sends the decrypted notification payload to the configured webhook endpoint via HTTP POST.
-async fn send_to_webhook(payload: &serde_json::Value) -> Result<()> {
-    let webhook_url = config::get_webhook_endpoint()?;
-    let client = Client::new();
-
-    tracing::info!(url = %webhook_url, "sending to webhook");
-
-    let response = client.post(&webhook_url).json(payload).send().await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("failed to read response body"));
-        tracing::warn!(status = %status, body = %error_text, "webhook request failed");
-    } else {
-        tracing::info!(status = %response.status(), "webhook request succeeded");
+fn decode_notification(
+    data: &str, headers: &Option<std::collections::HashMap<String, String>>,
+    keys: &crate::config::WebPushKeys,
+) -> Result<serde_json::Value> {
+    // Bound allocations before decoding untrusted push data.
+    if data.len() > 512 * 1024 {
+        return Err(AngelicAngelError::Decryption("notification is too large".into()));
     }
+    let encrypted = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, data)
+        .map_err(|_| AngelicAngelError::Decryption("notification encoding is invalid".into()))?;
+    let decrypted = decrypt_ece(&encrypted, headers, keys)?;
+    if decrypted.len() > 256 * 1024 {
+        return Err(AngelicAngelError::Decryption("notification is too large".into()));
+    }
+    serde_json::from_slice(&decrypted)
+        .map_err(|_| AngelicAngelError::Decryption("notification JSON is invalid".into()))
+}
 
-    Ok(())
+async fn report_health(queue: SharedOutbox, mut stop: watch::Receiver<bool>) -> Result<()> {
+    loop {
+        let snapshot = queue.lock().await.snapshot();
+        tracing::info!(pending = snapshot.pending, delivered = snapshot.delivered,
+            dead_letter = snapshot.dead_letter, storage_healthy = snapshot.storage_healthy,
+            next_attempt_unix_ms = ?snapshot.next_attempt_unix_ms, "queue health");
+        if snapshot.dead_letter > 0 { tracing::warn!(count = snapshot.dead_letter, "dead letters require operator review"); }
+        tokio::select! {
+            _ = cancelled(&mut stop) => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+        }
+    }
 }
 
 fn decrypt_ece(
@@ -376,7 +296,49 @@ fn parse_header_param(header_value: Option<&String>, param_name: &str) -> Result
     }
 
     Err(AngelicAngelError::Decryption(format!(
-        "param '{}' not found in header: {}",
-        param_name, header
+        "required header parameter '{}' is missing",
+        param_name
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_registration() -> Registration {
+        let private = p256::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        Registration {
+            endpoint: "https://example.invalid/synthetic".into(),
+            autopush: config::AutoPushSession {
+                uaid: "00000000-0000-4000-8000-000000000001".into(),
+                channel_id: "00000000-0000-4000-8000-000000000002".into(),
+            },
+            keys: config::WebPushKeys {
+                private_key: private.to_bytes().to_vec(),
+                public_key: private.public_key().to_sec1_bytes().to_vec(),
+                auth_secret: vec![2; 16],
+            },
+        }
+    }
+
+    #[test]
+    fn invalid_local_keys_fail_before_intake() {
+        let mut registration = valid_registration();
+        validate_registration(&registration).unwrap();
+        registration.keys.public_key[1] ^= 1;
+        assert!(validate_registration(&registration).is_err());
+        registration = valid_registration();
+        registration.keys.auth_secret.clear();
+        assert!(validate_registration(&registration).is_err());
+        registration = valid_registration();
+        registration.autopush.channel_id = "not-a-session".into();
+        assert!(validate_registration(&registration).is_err());
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        assert_eq!(calc_backoff(1), 5);
+        assert_eq!(calc_backoff(2), 10);
+        assert_eq!(calc_backoff(u32::MAX), 300);
+    }
 }

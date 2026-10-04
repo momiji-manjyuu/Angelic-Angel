@@ -1,109 +1,103 @@
-# Angelic Angel
+# Angelic Angel: durable collection branch
 
-> "Angelic Angel/Hello, Hoshi wo Kazoete" is a single by μ's released on July 1, 2015 from Lantis. The song is an insert song for the film *Love Live! The School Idol Movie*.
->
-> — [Wikipedia](https://ja.wikipedia.org/wiki/Angelic_Angel/Hello,%E6%98%9F%E3%82%92%E6%95%B0%E3%81%88%E3%81%A6)
+A Rust CLI for receiving Twitter/X Web Push notifications through Mozilla AutoPush.
+This fork adds a durable outbox, bounded retries, explicit notification-type filtering,
+and safer credential/log handling.
 
-A CLI tool that receives Twitter/X notifications in real time via Mozilla's Web Push infrastructure. Stream tweets from users you follow and have tweet notifications enabled for.
+**Experimental draft.** Compilation and runtime checks have not yet been performed.
+Read [the verification checklist](docs/VERIFICATION.md) before any real-account trial.
+No server, account connection, subscription, or background service is created merely
+by checking out this repository.
 
-[日本語版 README](README.ja.md)
+[日本語の運用手順](docs/OPERATIONS.ja.md)
 
-## Overview
+## Data flow
 
-Angelic Angel emulates a browser's Web Push client to receive Twitter/X push notifications. It connects to [Mozilla AutoPush](https://autopush.readthedocs.io/) via WebSocket, decrypts incoming notifications using ECE (Encrypted Content-Encoding), and forwards the decrypted payloads to a configured webhook endpoint.
+Registered AutoPush session → decrypt → explicit type allowlist → durable local outbox
+→ upstream ACK → independent HTTPS webhook delivery
 
-You will receive notifications for tweets from users that you **follow** and have **tweet notifications turned on** for on Twitter/X.
+The outbox is synced before acknowledging an accepted notification. Transient delivery
+failures retry; permanent failures and exhausted attempts remain as dead letters.
+A crash after downstream acceptance can still cause a duplicate: the receiver must
+honor the stable `Idempotency-Key` header.
 
-### How It Works
+This collects notifications that X chooses to emit. It is not an exhaustive stream,
+historical archive, or guarantee that every post/full text will be received.
+Treat all notification contents and URLs as untrusted data, never agent instructions.
 
-```
-Twitter/X  ──push──▶  Mozilla AutoPush Server  ◀──WebSocket──  Angelic Angel  ──HTTP POST──▶  Webhook
-```
+## Safety and operating model
 
-1. Angelic Angel registers as a Web Push subscriber with Mozilla's AutoPush server.
-2. The push subscription endpoint is registered with Twitter's notification settings API.
-3. When Twitter sends a push notification, it goes through Mozilla's AutoPush server — the same infrastructure used by Firefox.
-4. Angelic Angel receives and decrypts the notification via WebSocket, then forwards the payload to your webhook.
+- Run only in an explicitly approved, isolated execution environment with reviewed
+  egress, storage, and service supervision. This program does **not** enforce network
+  location, a VPN kill switch, or IP anonymity.
+- `listen` reuses an existing registration. An invalid UAID stops the process instead
+  of generating keys, creating a new subscription, or calling X automatically.
+- Registration and unregistration are explicit account-changing commands.
+- Use a secret manager / protected mounted credential file. Config and pending/dead-letter
+  payloads are **not encrypted by this application**. Use encrypted storage and access
+  controls where needed.
+- Existing config files must be private regular Unix files; new configs use atomic
+  mode-0600 writes. Status/debug output never displays cookie prefixes, keys, payloads,
+  endpoints, or raw HTTP/WebSocket bodies.
+- Cookie command-line arguments have been removed. `init` uses hidden interactive input.
+  Never paste cookies into chat, shell arguments, source files, or an issue.
+- A listener-only config may omit `[twitter]` after registration. Push keys/session
+  material remain sensitive. Re-registration requires an explicit, separate operation.
+- Only HTTPS webhooks are accepted. Redirects and environment proxy discovery are disabled.
+  The complete destination is bound to the outbox with a private salted fingerprint;
+  a destination change requires a fresh outbox.
+- Keep config, queue files, credentials, and real notifications out of this public repository.
 
-### Important Notes
+## Commands
 
-- **Data source**: All notification data is received from Mozilla's Web Push server (`push.services.mozilla.com`). Angelic Angel does not access Twitter/X directly for notification data.
-- **Minimal API usage**: The Twitter/X API is only called during the initial push subscription registration (`register` command). No API calls are made while listening for notifications.
-- **No scraping**: This tool does not perform any web scraping. It uses the standard W3C Push API flow, the same mechanism browsers use to deliver push notifications.
-
-## Requirements
-
-- Rust (edition 2024)
-- Twitter/X account credentials (`auth_token` and `ct0` cookies)
-
-### Getting `auth_token` and `ct0`
-
-1. Open [x.com](https://x.com) in your web browser and log in.
-2. Open Developer Tools (F12) and go to the **Application** (or **Storage**) tab.
-3. Under **Cookies** → `https://x.com`, find the values for `auth_token` and `ct0`.
-
-## Installation
-
-```sh
-cargo install --path .
-```
-
-## Usage
-
-### 1. Initialize configuration
-
-```sh
-# Interactive mode
-angelic-angel init
-
-# Or with arguments
-angelic-angel init --auth-token YOUR_AUTH_TOKEN --ct0 YOUR_CT0
-```
-
-This creates `angelic-angel.toml` with your Twitter credentials.
-
-### 2. Register push subscription
+Rust edition 2024 is required. After approving and reviewing execution in the intended
+environment, build/test with the commands in [VERIFICATION.md](docs/VERIFICATION.md).
+No test is expected to need real X cookies or a public network endpoint.
 
 ```sh
-angelic-angel register
+# Owner-run credential setup in an existing private directory
+angelic-angel --config /protected/config.toml init
+
+# Explicitly creates a Mozilla/X push registration
+angelic-angel --config /protected/config.toml register
+
+# Example schema only. Verify the actual type path and values before a real trial.
+WEBHOOK_ENDPOINT=https://receiver.example/notifications \
+  angelic-angel --config /protected/listener.toml listen \
+  --outbox /protected/outbox --type-pointer /type --allow-type tweet
+
+# Redacted registration/config status
+angelic-angel --config /protected/listener.toml status
+
+# Durable counts while stopped; an active/stale lock fails closed
+angelic-angel queue-status --outbox /protected/outbox
 ```
 
-This registers a new push subscription with Mozilla AutoPush and then registers the endpoint with Twitter's push notification API.
+The `/type=tweet` example is synthetic, not a claim about the current X notification
+schema. The type pointer and exact allowlist are required. Missing/non-string/disallowed
+types are intentionally discarded and acknowledged, with a countable redacted log event.
+This prevents unknown notification classes from being forwarded by default.
 
-### 3. Start listening
+## Durability, delivery, and recovery
 
-```sh
-WEBHOOK_ENDPOINT=https://your-webhook.example.com/endpoint angelic-angel listen
-```
+- Local filesystem with atomic rename and file/directory fsync is required
+- New queue directories use 0700; records use 0600; unsafe paths fail closed
+- Deduplication key: AutoPush channel ID + version, retained across restarts
+- Defaults: 256 KiB payloads, 10,000 retained records, 12 delivery attempts
+- Retry: transport failures, 408/425/429/5xx; exponential jitter up to 15 minutes
+- Retry-After: integer seconds or IMF-fixdate; a server delay is a lower bound
+- Other non-2xx statuses, including redirects, become dead letters
+- Connect/request timeouts: 10/30 seconds
+- SIGINT/SIGTERM stop acquisition and await durable operations
+- Live redacted queue counts are logged every 30 seconds
+- Delivered payloads are cleared; dedup metadata and dead-letter payloads remain
+- Disk/retention management is manual. A full/broken queue stops intake without ACK
+- A hard crash can leave a lock file. Verify the old process is gone before recovery;
+  never remove a live process's lock
 
-The `WEBHOOK_ENDPOINT` environment variable specifies where decrypted notification payloads are sent via HTTP POST.
+See [operations](docs/OPERATIONS.ja.md) for trial, monitoring, and recovery details.
 
-### Other commands
+## License and origin
 
-```sh
-# Check current configuration and registration status
-angelic-angel status
-
-# Remove push subscription
-angelic-angel unregister
-```
-
-### Options
-
-| Flag | Description |
-|------|-------------|
-| `-c, --config <PATH>` | Configuration file path (default: `angelic-angel.toml`) |
-| `-v, --verbose` | Enable debug logging |
-
-## Reconnection
-
-Angelic Angel implements a Firefox-compatible reconnection strategy:
-
-- Exponential backoff: 5s × 2^n, capped at 5 minutes
-- Automatic re-registration on UAID invalidation
-- Server backoff (close code 4774): 30-minute delay
-- Infinite retries with counter reset on successful connection
-
-## License
-
-MIT
+MIT. Based on [sh1ma/Angelic-Angel](https://github.com/sh1ma/Angelic-Angel),
+upstream commit `169a098e2025cc6e41a50fc8d521c483e21d9b6d`.
